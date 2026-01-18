@@ -81,6 +81,9 @@ class HoymilesStationDailyEnergySensor(SensorEntity):
         self._attr_should_poll = True
         self._attr_device_info = device_info
         self._state = None
+        self._last_update = 0
+        self._last_raw_value = None
+        self._raw_offset = 0
 
     @property
     def native_value(self):
@@ -93,14 +96,44 @@ class HoymilesStationDailyEnergySensor(SensorEntity):
 
     async def async_update(self):
         #only update the daily energy once every 2 minutes
-        if self._state is not None and (time.time() - self._last_update < 120):
+        now = time.time()
+        if self._last_update and (now - self._last_update < 120):
             _LOGGER.debug(f"Skipping update for station {self._sid}, last update was too recent.")
             return
-        self._last_update = time.time()
-
+        self._last_update = now
 
         _LOGGER.debug(f"Fetching daily energy for station {self._sid}")
-        daily_energy = await self._client.get_daily_power()
-        _LOGGER.debug(f"Received daily energy data for station {self._sid}: {daily_energy} kWh")
-        self._state = float(daily_energy)/1000
+        raw_daily_wh = await self._client.get_daily_power()
+        _LOGGER.debug(f"Received raw daily energy data for station {self._sid}: {raw_daily_wh} Wh")
+
+        # First reading: establish baseline so HA starts at 0 for the current day
+        if self._last_raw_value is None:
+            self._last_raw_value = raw_daily_wh
+            self._raw_offset = raw_daily_wh
+            self._state = 0.0
+            _LOGGER.debug(
+                f"Initial daily energy reading for station {self._sid}: {raw_daily_wh} Wh; "
+                f"setting baseline offset to {self._raw_offset} Wh and state to 0 kWh."
+            )
+            return
+
+        # Detect a reset of the DTU daily counter (value decreased). Treat the new raw
+        # value as the baseline (0 for HA) so the Energy dashboard sees a reset to 0,
+        # and future increases are reported as positive deltas above this baseline.
+        if raw_daily_wh < self._last_raw_value:
+            _LOGGER.debug(
+                f"Detected daily energy reset for station {self._sid}: "
+                f"raw value dropped from {self._last_raw_value} Wh to {raw_daily_wh} Wh. "
+                f"Updating baseline offset to {raw_daily_wh} Wh and resetting state to 0 kWh."
+            )
+            self._raw_offset = raw_daily_wh
+            self._last_raw_value = raw_daily_wh
+            self._state = 0.0
+            return
+
+        # Normal case: monotonically increasing during the day. Report the delta above
+        # the baseline so Home Assistant sees a total_increasing counter per day.
+        self._last_raw_value = raw_daily_wh
+        effective_wh = max(0, raw_daily_wh - self._raw_offset)
+        self._state = float(effective_wh) / 1000
         # Convert to kWh
